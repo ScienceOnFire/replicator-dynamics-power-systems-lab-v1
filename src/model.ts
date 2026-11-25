@@ -1,0 +1,19 @@
+export const methods=['Base','PID','LQR','MPC','RD','Distributed RD','Consensus','RD–MPC','Adaptive'] as const;
+export type Method=typeof methods[number];
+export type Config={H:number;load:number;event:number;duration:number;beta:number;agc:boolean;delay:number;cost:number[];n:number};
+export type Point={t:number;f:number;rocof:number;p:number;u:number;cost:number;shares:number[];outputs:number[];method:Method};
+export type State={t:number;f:number;z:number;gov:number;mech:number;p:number[];x:number[];u:number;df:number;history:Point[]};
+export const defaults:Config={H:4,load:0.15,event:5,duration:45,beta:2,agc:true,delay:0,cost:[1,2,4],n:3};
+export const dt=.02;
+export const clamp=(x:number,a:number,b:number)=>Math.max(a,Math.min(b,x));
+export function init(c:Config):State{return {t:0,f:0,z:0,gov:0,mech:0,p:Array(c.n).fill(0),x:Array(c.n).fill(1/c.n),u:0,df:0,history:[]}}
+const coeff=(c:Config,i:number)=>c.cost[i%3];
+// Receding-horizon scalar input optimization, with bounded command and move penalty.
+function mpc(s:State,c:Config,d:number){let best=0,J=Infinity;for(let j=0;j<=80;j++){const u=-.4+j*.01;let f=s.f,p=s.p.reduce((a,b)=>a+b,0),g=s.gov,m=s.mech;let cost=.08*(u-s.u)**2;for(let k=0;k<30;k++){g+=.1*(-f/(.05*50)-g)/.3;m+=.1*(g-m)/.8;p+=.1*(u-p)/.35;f+=.1*50/(2*c.H)*(m+p-d-.02*f);cost+=f*f+.025*u*u;}if(cost<J){J=cost;best=u}}return best}
+// Discrete Riccati iteration for aggregate frequency and actuator state.
+const gains=new Map<number,number[]>();
+function lqr(H:number){if(gains.has(H))return gains.get(H)!;const a=1-.1*50/(2*H)*.02,b=.1*50/(2*H),d=1-.1/.35,e=.1/.35;let p=1,q=0,r=.1,k1=0,k2=0;for(let i=0;i<300;i++){const den=.1+e*e*r;const v=e*q*a,w=e*(q*b+r*d);k1=v/den;k2=w/den;const P=1+a*a*p-v*v/den,Q=a*(p*b+q*d)-v*w/den,R=.1+b*b*p+2*b*d*q+d*d*r-w*w/den;p=P;q=Q;r=R}const k=[k1,k2];gains.set(H,k);return k}
+export function step(s:State,c:Config,method:Method){const d=s.t>=c.event?c.load:0;const enabled=method!=='Base';const f=s.f;const total=s.p.reduce((a,b)=>a+b,0);let target=c.agc?-.12*s.z:0;if(method==='PID')target+=-.18*f-.025*s.df;if(method==='Adaptive')target+=-(.08+ .4/c.H)*f;if(method==='LQR'){const [a,b]=lqr(c.H);target+=-a*f-b*total}if(method==='MPC'||method==='RD–MPC'){if(Math.round(s.t/dt)%5===0)target=mpc(s,c,d);else target=s.u;}target=clamp(target,-.4,.4);s.u=target;if(c.agc&&Math.abs(target)<.399)s.z+=dt*f;
+const fitness=s.x.map((v,i)=>-coeff(c,i)*v);const avg=s.x.reduce((a,v,i)=>a+v*fitness[i],0);let dx=s.x.map(()=>0);if(method==='RD'||method==='RD–MPC')dx=s.x.map((v,i)=>c.beta*v*(fitness[i]-avg));else if(method==='Distributed RD'||method==='Consensus'){const old=s.history[Math.max(0,s.history.length-1-Math.round(c.delay/.1))]?.shares??s.x;for(let i=0;i<c.n;i++){const j=(i+1)%c.n;const flow=c.beta*(method==='Consensus'?1:s.x[i]*s.x[j])*(-coeff(c,i)*old[i]+coeff(c,j)*old[j]);dx[i]+=flow;dx[j]-=flow}}else dx=s.x.map(v=>2*(1/c.n-v));s.x=s.x.map((v,i)=>Math.max(1e-8,v+dt*dx[i]));const sum=s.x.reduce((a,b)=>a+b,0);s.x=s.x.map(v=>v/sum);
+s.gov+=dt*(-f/(.05*50)-s.gov)/.3;s.mech+=dt*(s.gov-s.mech)/.8;s.p=s.p.map((v,i)=>v+dt*clamp((clamp(target*s.x[i],-.18,.18)-v)/.35,-.3,.3));const p=s.p.reduce((a,b)=>a+b,0);s.df=50/(2*c.H)*(s.mech+p-d-.02*f);s.f+=dt*s.df;s.t+=dt;if(Math.round(s.t/dt)%5===0)s.history.push({t:s.t,f:50+s.f,rocof:s.df,p:s.mech,u:p,cost:s.p.reduce((a,v,i)=>a+coeff(c,i)*v*v,0),shares:[...s.x],outputs:[...s.p],method});return s}
+export function metrics(h:Point[],c:Config){const a=h.filter(p=>p.t>=c.event);if(!a.length)return [NaN,NaN,NaN,NaN,NaN,NaN];let last=-1;a.forEach((p,i)=>{if(Math.abs(p.f-50)>.02)last=i});return [Math.min(...a.map(p=>p.f)),Math.max(...a.map(p=>Math.abs(p.rocof))),a.reduce((s,p)=>s+Math.abs(p.f-50)*.1,0),last===a.length-1?Infinity:Math.max(0,(a[last+1]?.t??c.event)-c.event),a.reduce((s,p)=>s+p.cost*.1,0),a.reduce((s,p)=>s+p.u*p.u*.1,0)]}
